@@ -45,6 +45,7 @@ import org.robolectric.annotation.Config;
 import org.robolectric.annotation.Config.Implementation;
 import org.robolectric.internal.AndroidSandbox.EnvironmentSpec;
 import org.robolectric.internal.ResourcesMode;
+import org.robolectric.internal.ShadowProvider;
 import org.robolectric.manifest.AndroidManifest;
 import org.robolectric.pluginapi.Sdk;
 import org.robolectric.pluginapi.SdkProvider;
@@ -52,7 +53,6 @@ import org.robolectric.pluginapi.config.ConfigurationStrategy.Configuration;
 import org.robolectric.pluginapi.perf.Metric;
 import org.robolectric.pluginapi.perf.PerfStatsReporter;
 import org.robolectric.plugins.DefaultSdkPicker;
-import org.robolectric.plugins.DefaultSdkProvider;
 import org.robolectric.plugins.SdkCollection;
 import org.robolectric.plugins.StubSdk;
 import org.robolectric.util.TempDirectory;
@@ -80,7 +80,7 @@ public class RobolectricTestRunnerTest {
     priorAlwaysInclude = System.getProperty("robolectric.alwaysIncludeVariantMarkersInTestName");
     System.clearProperty("robolectric.alwaysIncludeVariantMarkersInTestName");
 
-    sdkCollection = new SdkCollection(new DefaultSdkProvider(null));
+    sdkCollection = TestUtil.getSdkCollection();
   }
 
   @After
@@ -270,6 +270,23 @@ public class RobolectricTestRunnerTest {
     );
   }
 
+  @Test
+  public void shouldDiagnoseUnexecutedRunnables() throws Exception {
+    RobolectricTestRunner runner =
+        new SingleSdkRobolectricTestRunner(TestWithUnexecutedRunnables.class);
+    runner.run(notifier);
+    assertThat(events)
+        .containsExactly(
+            "started: failWithNoRunnables",
+            "failure: failing with no runnables",
+            "finished: failWithNoRunnables",
+            "started: failWithUnexecutedRunnables",
+            "failure: Main thread has queued unexecuted runnables. "
+                + "This might be the cause of the test failure. "
+                + "You might need a ShadowLooper#idle call.",
+            "finished: failWithUnexecutedRunnables");
+  }
+
   /////////////////////////////
 
   public static class AndroidEnvironmentWithFailingSetUp extends AndroidEnvironment {
@@ -277,8 +294,8 @@ public class RobolectricTestRunnerTest {
     public AndroidEnvironmentWithFailingSetUp(
         @Named("runtimeSdk") Sdk runtimeSdk,
         @Named("compileSdk") Sdk compileSdk,
-        ResourcesMode resourcesMode, ApkLoader apkLoader) {
-      super(runtimeSdk, compileSdk, resourcesMode, apkLoader);
+        ResourcesMode resourcesMode, ApkLoader apkLoader, ShadowProvider[] shadowProviders) {
+      super(runtimeSdk, compileSdk, resourcesMode, apkLoader, shadowProviders);
     }
 
     @Override
@@ -385,6 +402,24 @@ public class RobolectricTestRunnerTest {
       }
 
       fail("failed for the right reason");
+    }
+  }
+
+  /** Fixture for #shouldDiagnoseUnexecutedRunnables() */
+  @Ignore
+  @FixMethodOrder(MethodSorters.NAME_ASCENDING)
+  public static class TestWithUnexecutedRunnables {
+
+    @Test
+    public void failWithUnexecutedRunnables() {
+      Robolectric.getForegroundThreadScheduler().pause();
+      Robolectric.getForegroundThreadScheduler().post(() -> {});
+      fail("failing with unexecuted runnable");
+    }
+
+    @Test
+    public void failWithNoRunnables() {
+      fail("failing with no runnables");
     }
   }
 

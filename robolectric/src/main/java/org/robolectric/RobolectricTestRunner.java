@@ -15,13 +15,13 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
-import java.util.ServiceLoader;
 import java.util.concurrent.atomic.AtomicInteger;
 import javax.annotation.Nonnull;
 import javax.annotation.Priority;
 import org.junit.AssumptionViolatedException;
 import org.junit.runners.model.FrameworkMethod;
 import org.junit.runners.model.InitializationError;
+import org.junit.runners.model.Statement;
 import org.robolectric.android.AndroidInterceptors;
 import org.robolectric.annotation.Config;
 import org.robolectric.internal.AndroidConfigurer;
@@ -35,7 +35,6 @@ import org.robolectric.internal.MavenManifestFactory;
 import org.robolectric.internal.ResourcesMode;
 import org.robolectric.internal.SandboxManager;
 import org.robolectric.internal.SandboxTestRunner;
-import org.robolectric.internal.ShadowProvider;
 import org.robolectric.internal.bytecode.ClassHandler;
 import org.robolectric.internal.bytecode.InstrumentationConfiguration;
 import org.robolectric.internal.bytecode.InstrumentationConfiguration.Builder;
@@ -51,8 +50,10 @@ import org.robolectric.pluginapi.config.ConfigurationStrategy;
 import org.robolectric.pluginapi.config.ConfigurationStrategy.Configuration;
 import org.robolectric.pluginapi.config.GlobalConfigProvider;
 import org.robolectric.plugins.HierarchicalConfigurationStrategy.ConfigurationImpl;
+import org.robolectric.shadows.ShadowApplication;
 import org.robolectric.util.PerfStatsCollector;
 import org.robolectric.util.ReflectionHelpers;
+import org.robolectric.util.Scheduler;
 import org.robolectric.util.inject.Injector;
 
 /**
@@ -78,8 +79,8 @@ public class RobolectricTestRunner extends SandboxTestRunner {
   private final SandboxManager sandboxManager;
   private final SdkPicker sdkPicker;
   private final ConfigurationStrategy configurationStrategy;
+  private final AndroidConfigurer androidConfigurer;
 
-  private ServiceLoader<ShadowProvider> providers;
   private final ResModeStrategy resModeStrategy = getResModeStrategy();
   private boolean alwaysIncludeVariantMarkersInName =
       Boolean.parseBoolean(
@@ -106,6 +107,7 @@ public class RobolectricTestRunner extends SandboxTestRunner {
     this.sandboxManager = injector.getInstance(SandboxManager.class);
     this.sdkPicker = injector.getInstance(SdkPicker.class);
     this.configurationStrategy = injector.getInstance(ConfigurationStrategy.class);
+    this.androidConfigurer = injector.getInstance(AndroidConfigurer.class);
   }
 
   /**
@@ -150,8 +152,8 @@ public class RobolectricTestRunner extends SandboxTestRunner {
     Config config = configuration.get(Config.class);
 
     Builder builder = new Builder(super.createClassLoaderConfig(method));
-    AndroidConfigurer.configure(builder, getInterceptors());
-    AndroidConfigurer.withConfig(builder, config);
+    androidConfigurer.configure(builder, getInterceptors());
+    androidConfigurer.withConfig(builder, config);
     return builder.build();
   }
 
@@ -291,8 +293,6 @@ public class RobolectricTestRunner extends SandboxTestRunner {
     Class<TestLifecycle> cl = androidSandbox.bootstrappedClass(getTestLifecycleClass());
     roboMethod.testLifecycle = ReflectionHelpers.newInstance(cl);
 
-    providers = ServiceLoader.load(ShadowProvider.class, androidSandbox.getRobolectricClassLoader());
-
     AndroidManifest appManifest = roboMethod.getAppManifest();
 
     roboMethod.getEnvironment().setUpApplicationState(
@@ -326,14 +326,8 @@ public class RobolectricTestRunner extends SandboxTestRunner {
     try {
       // reset static state afterward too, so statics don't defeat GC?
       PerfStatsCollector.getInstance()
-          .measure("reset Android state (after test)", () -> {
-            // TODO: roboMethod.sandbox.resetState(); instead
-            if (providers != null) {
-              for (ShadowProvider provider : providers) {
-                provider.reset();
-              }
-            }
-          });
+          .measure(
+              "reset Android state (after test)", () -> roboMethod.getEnvironment().resetState());
     } finally {
       roboMethod.testLifecycle = null;
       roboMethod.clearContext();
@@ -536,6 +530,46 @@ public class RobolectricTestRunner extends SandboxTestRunner {
       roboMethod.testLifecycle.prepareTest(test);
       return test;
     }
+
+    @Override
+    protected Statement methodBlock(FrameworkMethod method) {
+      RobolectricFrameworkMethod roboMethod = (RobolectricFrameworkMethod) this.frameworkMethod;
+      return new LooperDiagnosingStatement(
+          roboMethod.getSandbox().getRobolectricClassLoader(), super.methodBlock(method));
+    }
+  }
+
+  private static class LooperDiagnosingStatement extends Statement {
+
+    private final Statement baseStatement;
+    private final ClassLoader robolectricClassLoader;
+
+    public LooperDiagnosingStatement(ClassLoader robolectricClassLoader, Statement methodBlock) {
+      this.baseStatement = methodBlock;
+      this.robolectricClassLoader = robolectricClassLoader;
+    }
+
+    @Override
+    public void evaluate() throws Throwable {
+      try {
+        baseStatement.evaluate();
+      } catch (Throwable t) {
+        // need to get ShadowApplication from sandbox class loader, not the current classloader
+        Class clazz =
+            ReflectionHelpers.loadClass(robolectricClassLoader, ShadowApplication.class.getName());
+        Object instance = ReflectionHelpers.callStaticMethod(clazz, "getInstance");
+        Scheduler scheduler =
+            ReflectionHelpers.callInstanceMethod(instance, "getForegroundThreadScheduler");
+        if (scheduler.areAnyRunnable()) {
+          throw new Exception(
+              "Main thread has queued unexecuted runnables. "
+                  + "This might be the cause of the test failure. "
+                  + "You might need a ShadowLooper#idle call.",
+              t);
+        }
+        throw t;
+      }
+    }
   }
 
   /**
@@ -581,7 +615,7 @@ public class RobolectricTestRunner extends SandboxTestRunner {
     @Override
     public String getName() {
       // IDE focused test runs rely on preservation of the test name; we'll use the
-      //   latest supported SDK for focused test runs
+      // latest supported SDK for focused test runs
       StringBuilder buf = new StringBuilder(super.getName());
 
       if (includeVariantMarkersInTestName || alwaysIncludeVariantMarkersInName) {
@@ -686,5 +720,4 @@ public class RobolectricTestRunner extends SandboxTestRunner {
       }
     }
   }
-
 }
